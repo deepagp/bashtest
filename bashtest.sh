@@ -1,108 +1,147 @@
-#!/bin/sh
-# tar comparison program
-# 2007-10-25 Jan Psota
+#!/usr/bin/env bash
+#
+# Copyright (C) 2018 Gaëtan Harter <gaetan.harter@fu-berlin.de>
+#
+# This file is subject to the terms and conditions of the GNU Lesser
+# General Public License v2.1. See the file LICENSE in the top level
+# directory for more details.
+#
 
-n=3                                     # number of repetitions
-TAR="bsdtar gnutar star"                # Tape archivers to compare
-OPT=("" "--seek" "-no-fsync")
-pax="--format=pax"                      # comment out for defaults
-OPN=(create list extract compare)       # operations
-version="2007-10-25"
-TIMEFORMAT=$'%R\t%U\t%S\t%P'
-LC_ALL=C
+#
+# Central test script to have sanity checks for the build system
+# It is run unconditionally on all files.
+#
+#
 
-test $# -ge 2 || {
-        echo -e "usage:\t$0 source_dir where_to_place_archive 
-[where_to_extract_it]
-TCP, version $version
-TCP stands for Tar Comparison Program here.
-It currently compares: BSD tar (bsdtar), GNU tar (gnutar) and star in archive
-creation, listing, extraction and archive-to-extracted comparison.
-Tcp prints out best time of n=$n repetitions.
-Tcp creates temporary archive named tcp.tar with $pax and some native
-(--seek/-no-fsync) options and extracts it to [\$3]/tcptmp/.
-If unset, third argument defaults to [\$2].
-After normal exit tcp removes tarball and extracted files.
-Tcp does not check filesystems destination directories are on for free space,
-so make sure there is enough space (a bit more than source_dir uses) for both:
-archive and extracted files.
-Do not use white space in arguments.
-        Jan Psota, $version"
-        exit 0
-}
-src=$1
-dst=$2/tcp.tar
-dst_path=${3:-$2}/tcptmp
-test -e $dst -o -e /tmp/tcp \
-        && { echo "$dst or /tmp/tcp exists, exiting"; exit 1; }
-mkdir $dst_path || exit 2
+: "${RIOTBASE:="$(cd "$(dirname "$0")/../../../" || exit; pwd)"}"
 
-use_times ()
-{
-        awk -F"\t" -vN=$n -vL="`du -k $dst`" -vOFS="\t" -vORS="" '
-                { if (NF==4) { printf "\t%s\t%10.1d KB/s\n", $0, ($1+0>0 ? 
-(L+0)/($1+0) : 0) } }' \
-                /tmp/tcp | sort | head -1
-        > /tmp/tcp
+SCRIPT_PATH=dist/tools/buildsystem_sanity_check/check.sh
+
+
+tab_indent() {
+    # Ident using 'bashism' to to the tab compatible with 'bsd-sed'
+    sed 's/^/\'$'\t/'
 }
 
-test -d $src || { echo "'$src' is not a directory"; exit 3; }
+prepend() {
+    # 'i' needs 'i\{newline}' and a newline after for 'bsd-sed'
+    sed '1i\
+'"$1"'
+'
+}
 
-# system information: type, release, memory, cpu(s), compiler and flags
-echo -e "TCP, version $version\n"`uname -sr`" / "`head -1 /etc/*-release`
-free -m | awk '/^Mem/ { printf "%dMB of memory, ", $2 }'
-test -e /proc/cpuinfo \
-        && awk -F: '/name|cache size|MHz|mips/ { if (!a) b=b $2 }
-        /^$/ { a++ } END { print a" x"b" bmips" }' /proc/cpuinfo
-test -e /etc/gentoo-release \
-        && gcc --version | head -1 && grep ^CFLAGS /etc/make.conf
+error_with_message() {
+    tab_indent | prepend "${1}"
+}
 
-# tar versions
-t=
-echo
-for tar in $TAR; do 
-	if which $tar &> /dev/null; then
-		t="$t $tar";
-		echo -ne "$tar:\t"; $tar --version | head -1; 
-	fi
-done
 
-TAR="$t"
+# Modules should not check the content of FEATURES_PROVIDED/_REQUIRED/OPTIONAL
+# Handling specific behaviors/dependencies should by checking the content of:
+# * `USEMODULE`
+# * maybe `FEATURES_USED` if it is not a module (== not a periph_)
+check_not_parsing_features() {
+    local patterns=()
+    local pathspec=()
 
-echo -e "\nbest time of $n repetitions,\n"\
-"       src=$src, "\
-`du -sh $src | awk '{print $1}'`" in "`find $src | wc -l`" files, "\
-"avg "$((`du -sk $src | awk '{print $1}'`/`find $src -type f | wc -l`))"KB/file,\n"\
-"       archive=$dst, extract to $dst_path"
+    patterns+=(-e 'if.*filter.*FEATURES_PROVIDED')
+    patterns+=(-e 'if.*filter.*FEATURES_REQUIRED')
+    patterns+=(-e 'if.*filter.*FEATURES_OPTIONAL')
 
-echo -e "program\toperation\treal\tuser\tsystem\t%CPU\t     speed"
-> /tmp/tcp
-let op_num=0
-for op in "cf $dst $pax -C $src ." "tf $dst" "xf $dst -C $dst_path" \
-        "f $dst -C $dst_path --diff"; do
-        let tar_num=0
-        for tar in $TAR; do
-                echo -en "$tar\t${OPN[op_num]}\t"
-                for ((i=1; i<=$n; i++)); do
-                        echo $op | grep -q ^cf && rm -f $dst
-                        echo $op | grep -q ^xf &&
-                                { chmod -R u+w $dst_path
-                                rm -rf $dst_path; mkdir $dst_path; }
-                        sync
-                        if echo $op | grep -q ^f; then  # op == compare
-                                time $tar $op ${OPT[$tar_num]} > /dev/null
-                        else    # op in (create | list | extract)
-                                time $tar $op ${OPT[$tar_num]} > /dev/null \
-                                        || break 3
-                        fi 2>> /tmp/tcp
-                done
-                use_times
-                let tar_num++
-        done
-        let op_num++
-        echo
-done
-rm -rf $dst_path $dst
-echo
-cat /tmp/tcp
-rm -f /tmp/tcp
+    # Pathspec with exclude should start by an inclusive pathspec in git 2.7.4
+    pathspec+=('*')
+
+    # Ignore this file when matching as it self matches
+    pathspec+=(":!${SCRIPT_PATH}")
+
+    # These two files contain sanity checks using FEATURES_ so are allowed
+    pathspec+=(':!Makefile.include' ':!makefiles/info-global.inc.mk')
+
+    git -C "${RIOTBASE}" grep "${patterns[@]}" -- "${pathspec[@]}" \
+        | error_with_message 'Modules should not check the content of FEATURES_PROVIDED/_REQUIRED/OPTIONAL'
+}
+
+# Some variables do not need to be exported and even cause issues when being
+# exported because they are evaluated even when not needed.
+#
+# Currently this blacklists exported variables instead of whitelisting or
+# providing a mechanism for handling it.
+# It just keep things not exported anymore in the future.
+UNEXPORTED_VARIABLES=()
+UNEXPORTED_VARIABLES+=('FLASHFILE')
+UNEXPORTED_VARIABLES+=('TERMPROG' 'TERMFLAGS')
+UNEXPORTED_VARIABLES+=('FLASHER' 'FFLAGS')
+UNEXPORTED_VARIABLES+=('RESET' 'RESETFLAGS')
+UNEXPORTED_VARIABLES+=('DEBUGGER' 'DEBUGGER_FLAGS')
+UNEXPORTED_VARIABLES+=('DEBUGSERVER' 'DEBUGSERVER_FLAGS')
+UNEXPORTED_VARIABLES+=('PREFLASHER' 'PREFFLAGS' 'FLASHDEPS')
+UNEXPORTED_VARIABLES+=('DEBUG_ADAPTER' 'DEBUG_ADAPTER_ID')
+UNEXPORTED_VARIABLES+=('PROGRAMMER_SERIAL')
+UNEXPORTED_VARIABLES+=('STLINK_VERSION')
+UNEXPORTED_VARIABLES+=('PORT_LINUX' 'PORT_DARWIN')
+
+EXPORTED_VARIABLES_ONLY_IN_VARS=()
+check_not_exporting_variables() {
+    local patterns=()
+    local pathspec=()
+
+    for variable in "${UNEXPORTED_VARIABLES[@]}"; do
+        patterns+=(-e "export[[:blank:]]\+${variable}")
+    done
+
+    git -C "${RIOTBASE}" grep "${patterns[@]}" \
+        | error_with_message 'Variables must not be exported:'
+
+    # Some variables may still be exported in 'makefiles/vars.inc.mk' as the
+    # only place that should export commont variables
+    pathspec+=('*')
+    pathspec+=(':!makefiles/vars.inc.mk')
+
+    patterns=()
+    for variable in "${EXPORTED_VARIABLES_ONLY_IN_VARS[@]}"; do
+        patterns+=(-e "export[[:blank:]]\+${variable}")
+    done
+
+    # Only run if there are patterns, otherwise it matches everything
+    if [ ${#patterns[@]} -ne 0 ]; then
+        git -C "${RIOTBASE}" grep "${patterns[@]}" -- "${pathspec[@]}" \
+            | error_with_message 'Variables must only be exported in `makefiles/vars.inc.mk`:'
+    fi
+}
+
+# Deprecated variables or patterns
+# Prevent deprecated variables or patterns to re-appear after cleanup
+check_deprecated_vars_patterns() {
+    local patterns=()
+    local pathspec=()
+
+    patterns+=(-e 'FEATURES_MCU_GROUP')
+
+    # Pathspec with exclude should start by an inclusive pathspec in git 2.7.4
+    pathspec+=('*')
+
+    # Ignore this file when matching as it self matches
+    pathspec+=(":!${SCRIPT_PATH}")
+
+    git -C "${RIOTBASE}" grep "${patterns[@]}" -- "${pathspec[@]}" \
+        | error_with_message 'Deprecated variables or patterns:'
+}
+
+error_on_input() {
+    grep '' && return 1
+}
+
+all_checks() {
+    check_not_parsing_features
+    check_not_exporting_variables
+    check_deprecated_vars_patterns
+}
+
+main() {
+    all_checks | prepend 'Invalid build system patterns found by '"${0}:"  || error_on_input >&2
+    exit $?
+}
+
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main
+fi
